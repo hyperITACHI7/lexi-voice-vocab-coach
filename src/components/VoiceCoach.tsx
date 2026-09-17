@@ -1,14 +1,29 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
+import { LessonPanel } from "./LessonPanel";
+import { RecapCard } from "./RecapCard";
 import { StatusOrb } from "./StatusOrb";
 import { Transcript } from "./Transcript";
+import type { Level } from "@/lib/engine/types";
 import { GROQ_VOICES, type GroqVoice } from "@/lib/voice/speaker";
 import { PATIENCE, type Patience } from "@/lib/voice/turnTaking";
-import { useVoiceCoach, type Metrics, type Settings } from "@/lib/voice/useVoiceCoach";
+import { useVoiceCoach, type Metrics, type Settings, type TurnLog } from "@/lib/voice/useVoiceCoach";
 
 const SETTINGS_KEY = "lexi.settings.v1";
-const DEFAULT_SETTINGS: Settings = { patience: "balanced", voice: "browser", groqVoice: "diana", headphones: false };
+const DEFAULT_SETTINGS: Settings = {
+  level: "upper_intermediate",
+  patience: "balanced",
+  voice: "browser",
+  groqVoice: "diana",
+  headphones: false,
+};
+
+const LEVEL_OPTIONS: { value: Level; label: string }[] = [
+  { value: "intermediate", label: "Intermediate" },
+  { value: "upper_intermediate", label: "Upper-intermediate" },
+  { value: "advanced", label: "Advanced" },
+];
 
 function loadSettings(): Settings {
   try {
@@ -63,10 +78,11 @@ export function VoiceCoach() {
   return (
     <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-5 px-4 py-6 sm:py-10">
       <header className="flex flex-col gap-1">
-        <p className="text-xs font-medium uppercase tracking-widest text-accent">Lexi · Phase 1 prototype</p>
-        <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">Talk your way to new words</h1>
+        <p className="text-xs font-medium uppercase tracking-widest text-accent">Lexi · voice vocabulary coach</p>
+        <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">Don&apos;t just learn words. Use them.</h1>
         <p className="text-sm text-muted">
-          A voice coach that teaches you a word, then gets you using it in your own sentences.
+          Lexi teaches you 3 words, then gives you a quick speaking challenge for each one. The word stays hidden, so you
+          have to recall it and use it in your own sentence. Stuck? You get hints, not answers.
         </p>
       </header>
 
@@ -79,6 +95,13 @@ export function VoiceCoach() {
 
       <section className="flex flex-col items-center gap-5 rounded-3xl border border-border bg-surface px-4 py-8">
         <StatusOrb status={coach.status} levelRef={coach.levelRef} />
+
+        {!active && (
+          <fieldset className="flex flex-col items-center gap-2">
+            <legend className="sr-only">Your level</legend>
+            <Segmented value={settings.level} options={LEVEL_OPTIONS} onChange={(v) => update({ level: v })} />
+          </fieldset>
+        )}
 
         <div className="flex flex-wrap items-center justify-center gap-3">
           {!active ? (
@@ -128,6 +151,16 @@ export function VoiceCoach() {
         </div>
       )}
 
+      {active && coach.lesson && (
+        <LessonPanel
+          lesson={coach.lesson}
+          busy={coach.status === "thinking"}
+          onHint={() => coach.sendAction("hint")}
+          onSkip={() => coach.sendAction("skip")}
+        />
+      )}
+      {coach.status === "ended" && coach.lesson && <RecapCard lesson={coach.lesson} />}
+
       <section className="flex min-h-48 flex-col gap-3 rounded-3xl border border-border bg-surface p-4">
         <Transcript turns={coach.turns} draft={coach.draft} />
         {active && (
@@ -155,7 +188,7 @@ export function VoiceCoach() {
       </section>
 
       <SettingsPanel settings={settings} onChange={update} />
-      <MetricsPanel metrics={coach.metrics} sttEngine={coach.sttEngine} />
+      <MetricsPanel metrics={coach.metrics} sttEngine={coach.sttEngine} log={coach.log} />
     </main>
   );
 }
@@ -258,12 +291,22 @@ function median(xs: number[]) {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-function MetricsPanel({ metrics, sttEngine }: { metrics: Metrics; sttEngine: "groq" | "browser" }) {
+function downloadLog(log: TurnLog[]) {
+  const blob = new Blob([JSON.stringify(log, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `lexi-session-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function MetricsPanel({ metrics, sttEngine, log }: { metrics: Metrics; sttEngine: "groq" | "browser"; log: TurnLog[] }) {
   const fmt = (ms: number | null) => (ms === null ? "–" : `${(ms / 1000).toFixed(2)}s`);
   const last = (xs: number[]) => (xs.length ? xs[xs.length - 1] : null);
   return (
     <details className="rounded-2xl border border-border bg-surface px-4 py-3 text-sm">
-      <summary className="cursor-pointer font-medium">Latency (for testing)</summary>
+      <summary className="cursor-pointer font-medium">Testing tools</summary>
       <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 font-mono text-xs sm:grid-cols-4">
         <div>
           <dt className="text-muted">Reply → voice (last)</dt>
@@ -285,7 +328,22 @@ function MetricsPanel({ metrics, sttEngine }: { metrics: Metrics; sttEngine: "gr
           <dt className="text-muted">Speech recognition</dt>
           <dd>{sttEngine === "groq" ? "Groq Whisper" : "Browser (Web Speech API)"}</dd>
         </div>
+        <div>
+          <dt className="text-muted">Judge (median)</dt>
+          <dd>{fmt(median(log.map((l) => l.judgeMs).filter((ms) => ms > 0)))}</dd>
+        </div>
+        <div>
+          <dt className="text-muted">Word redactions</dt>
+          <dd>{log.reduce((n, l) => n + (l.redactions ?? 0), 0)}</dd>
+        </div>
       </dl>
+      <button
+        onClick={() => downloadLog(log)}
+        disabled={!log.length}
+        className="mt-3 rounded-full border border-border px-4 py-2 text-xs font-medium disabled:opacity-40"
+      >
+        Download session log ({log.length} turns)
+      </button>
     </details>
   );
 }

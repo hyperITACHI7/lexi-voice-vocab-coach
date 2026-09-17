@@ -13,6 +13,8 @@
   --user: #eef1f8;
   --warn-bg: #fff4dc;
   --warn-text: #7a5300;
+  --ok-bg: #e2f2e6;
+  --ok-text: #1f6b35;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -29,10 +31,14 @@
     --user: #212634;
     --warn-bg: #3a2e14;
     --warn-text: #f3d28f;
+    --ok-bg: #1d3526;
+    --ok-text: #9fdcb0;
   }
 }
 
 :root[data-theme="dark"] {
+  --ok-bg: #1d3526;
+  --ok-text: #9fdcb0;
   --bg: #121412;
   --surface: #1b1e1c;
   --surface-2: #242826;
@@ -60,6 +66,8 @@
   --color-user: var(--user);
   --color-warn-bg: var(--warn-bg);
   --color-warn-text: var(--warn-text);
+  --color-ok-bg: var(--ok-bg);
+  --color-ok-text: var(--ok-text);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }

@@ -11,11 +11,15 @@ export class SentenceSplitter {
     let start = 0;
     for (let i = 0; i < this.buffer.length; i++) {
       const ch = this.buffer[i];
-      const isEnd = ch === "\n" || (/[.!?]/.test(ch) && /\s/.test(this.buffer[i + 1] ?? "x"));
-      if (!isEnd) continue;
-      const sentence = this.buffer.slice(start, i + 1).trim();
+      if (ch !== "\n" && !/[.!?]/.test(ch)) continue;
+      // Closing quotes/brackets belong to the sentence they end: `…strengths.” Next`.
+      let end = i;
+      while (/["'”’)\]]/.test(this.buffer[end + 1] ?? "")) end++;
+      if (ch !== "\n" && !/\s/.test(this.buffer[end + 1] ?? "x")) continue;
+      const sentence = this.buffer.slice(start, end + 1).trim();
       if (sentence) out.push(sentence);
-      start = i + 1;
+      start = end + 1;
+      i = end;
     }
     this.buffer = this.buffer.slice(start);
     return out;

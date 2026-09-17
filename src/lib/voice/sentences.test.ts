@@ -11,6 +11,15 @@ test("splits streamed text into sentences", () => {
   assert.equal(s.flush(), null);
 });
 
+test("closing quotes stay with their sentence", () => {
+  const s = new SentenceSplitter();
+  assert.deepEqual(s.push("For example, “Give a concise answer.” Think of a time? Yes. "), [
+    "For example, “Give a concise answer.”",
+    "Think of a time?",
+    "Yes.",
+  ]);
+});
+
 test("waits for whitespace after a terminator", () => {
   const s = new SentenceSplitter();
   assert.deepEqual(s.push("Great."), []);

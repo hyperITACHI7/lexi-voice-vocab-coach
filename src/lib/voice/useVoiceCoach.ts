@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MicVAD } from "@ricky0123/vad-web";
+import { createSession, finishSession } from "@/lib/engine/session";
+import type { Analysis, Directive, Level, SessionState, Verdict, Verification } from "@/lib/engine/types";
 import { BrowserStt, browserSttSupported } from "./browserStt";
 import { GREETING_TEXT } from "./greeting";
-import { SentenceSplitter } from "./sentences";
 import { Speaker, type GroqVoice, type VoiceEngine } from "./speaker";
 import { HOLD_REQUEST_MAX_MS, PATIENCE, decideTurn, joinSegments, stripLeadingHolds, type Patience } from "./turnTaking";
 import { encodeWav } from "./wav";
@@ -27,9 +28,34 @@ export type Turn = {
   streaming?: boolean;
   interrupted?: boolean;
   typed?: boolean;
+  /** Learner pressed Hint/Skip instead of speaking. */
+  action?: boolean;
+  verdict?: Verdict;
+  matchedForm?: string | null;
+};
+
+/** One learner turn as the lesson engine saw it; downloadable for eval review. */
+export type TurnLog = {
+  at: string;
+  wordId: string | null;
+  hintLevelBefore: number | null;
+  utterance: string | null;
+  action: string | null;
+  analysis: Analysis | null;
+  verification: Verification | null;
+  verdict: Verdict;
+  directive: Directive["kind"];
+  judgeModel: string | null;
+  judgeFallback: boolean;
+  judgeMs: number;
+  replyModel?: string;
+  replyMs?: number;
+  redactions?: number;
+  reply: string;
 };
 
 export type Settings = {
+  level: Level;
   patience: Patience;
   voice: VoiceEngine;
   groqVoice: GroqVoice;
@@ -52,10 +78,13 @@ type Inflight = {
   requestedAt: number;
   speechEndedAt: number | null;
   audioStarted: boolean;
+  /** Lesson state before this turn, restored if the learner cuts in before the coach speaks. */
+  lessonBefore: SessionState | null;
+  sessionComplete: boolean;
 };
 
-const SESSION_CAP_MS = 10 * 60 * 1000;
-const HISTORY_LIMIT = 20;
+const SESSION_CAP_MS = 8 * 60 * 1000;
+const HISTORY_LIMIT = 8;
 
 export type SttEngine = "groq" | "browser";
 
@@ -68,6 +97,8 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
   const [micAvailable, setMicAvailable] = useState(true);
   const [sttEngine, setSttEngine] = useState<SttEngine>("groq");
   const [metrics, setMetrics] = useState<Metrics>({ responseMs: [], endToEndMs: [] });
+  const [lesson, setLesson] = useState<SessionState | null>(null);
+  const [log, setLog] = useState<TurnLog[]>([]);
 
   const settingsRef = useRef(settings);
   const turnsRef = useRef<Turn[]>([]);
@@ -92,6 +123,7 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
   const lastSpeechEndAt = useRef<number | null>(null);
 
   const inflight = useRef<Inflight | null>(null);
+  const lessonRef = useRef<SessionState | null>(null);
   const capTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -102,6 +134,11 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
       speaker.groqVoice = settings.groqVoice;
     }
   }, [settings]);
+
+  const setLessonBoth = useCallback((next: SessionState | null) => {
+    lessonRef.current = next;
+    setLesson(next);
+  }, []);
 
   const setStatusBoth = useCallback((s: Status) => {
     statusRef.current = s;
@@ -175,9 +212,14 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
       f.controller.abort();
       speakerRef.current?.stop();
 
-      if (!f.audioStarted && reason === "barge_in" && f.userTurnId !== -1) {
+      if (!f.audioStarted && reason === "barge_in" && f.userTurnId !== -1 && f.userText) {
         // The coach hadn't started talking: treat the learner's new speech as a continuation.
         updateTurns((t) => t.filter((x) => x.id !== f.userTurnId && x.id !== f.assistantTurnId));
+        if (f.lessonBefore && lessonRef.current !== f.lessonBefore) {
+          // The engine already applied this turn; undo it so the full utterance is judged once.
+          setLessonBoth(f.lessonBefore);
+          setLog((l) => l.slice(0, -1));
+        }
         return f.userText;
       }
       const assistant = turnsRef.current.find((x) => x.id === f.assistantTurnId);
@@ -188,7 +230,7 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
       }
       return "";
     },
-    [patchTurn, updateTurns],
+    [patchTurn, setLessonBoth, updateTurns],
   );
 
   const afterCoachDone = useCallback(async () => {
@@ -197,25 +239,35 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
     if (micAvailableRef.current) await micOpen(true);
   }, [micOpen, setStatusBoth]);
 
-  /** Sends the learner's message and streams + speaks the coach's reply. */
-  const respond = useCallback(
-    async (userText: string, opts: { typed?: boolean } = {}) => {
+  const endRef = useRef<() => Promise<void>>(async () => {});
+
+  /** Sends the learner's turn (speech, typing, or a button) and streams + speaks the coach's reply. */
+  const runTurn = useCallback(
+    async (input: { utterance?: string; action?: "hint" | "skip" | "time_up"; typed?: boolean }) => {
       const speaker = speakerRef.current!;
-      const userTurnId = addTurn({ role: "user", text: userText, typed: opts.typed });
+      const lessonBefore = lessonRef.current;
+      if (!lessonBefore) return;
       const history = turnsRef.current
-        .filter((t) => t.text.trim())
+        .filter((t) => t.text.trim() && !t.action)
         .slice(-HISTORY_LIMIT)
         .map((t) => ({ role: t.role, content: t.interrupted ? `${t.text} [interrupted]` : t.text }));
+      const userText =
+        input.utterance ?? (input.action === "hint" ? "Hint, please." : input.action === "skip" ? "Skip this word." : "");
+      const userTurnId = userText
+        ? addTurn({ role: "user", text: userText, typed: input.typed, action: Boolean(input.action) })
+        : -1;
       const assistantTurnId = addTurn({ role: "assistant", text: "", streaming: true });
 
       const f: Inflight = {
         controller: new AbortController(),
         userTurnId,
-        userText,
+        userText: input.utterance ?? "",
         assistantTurnId,
         requestedAt: performance.now(),
-        speechEndedAt: opts.typed ? null : lastSpeechEndAt.current,
+        speechEndedAt: input.typed || input.action ? null : lastSpeechEndAt.current,
         audioStarted: false,
+        lessonBefore,
+        sessionComplete: false,
       };
       inflight.current = f;
       setStatusBoth("thinking");
@@ -237,58 +289,96 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
         onDone: () => {
           if (inflight.current !== f) return;
           inflight.current = null;
-          void afterCoachDone();
+          if (f.sessionComplete) void endRef.current();
+          else void afterCoachDone();
         },
         onFallback: (reason) => setNotice(`${reason}. Using your browser's voice instead.`),
       };
 
+      let entry: TurnLog | null = null;
       try {
-        const res = await fetch("/api/chat", {
+        const res = await fetch("/api/turn", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: history }),
+          body: JSON.stringify({ state: lessonBefore, history, utterance: input.utterance, action: input.action }),
           signal: f.controller.signal,
         });
         if (!res.ok || !res.body) {
           const body = await res.json().catch(() => ({}));
           throw new Error(
             res.status === 429
-              ? "The coach is getting too many requests (Groq free-tier limit). Wait a minute and try again."
-              : body.message ?? "The coach is unavailable right now.",
+              ? "Lexi is getting too many requests (Groq free-tier limit). Wait a minute and try again."
+              : body.message ?? "Lexi is unavailable right now.",
           );
         }
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
-        const splitter = new SentenceSplitter();
+        let buffer = "";
         let text = "";
         for (;;) {
           const { value, done } = await reader.read();
           if (done) break;
           if (inflight.current !== f) return;
-          const delta = decoder.decode(value, { stream: true });
-          text += delta;
-          patchTurn(assistantTurnId, { text });
-          for (const sentence of splitter.push(delta)) speaker.enqueue(sentence);
+          buffer += decoder.decode(value, { stream: true });
+          let newline: number;
+          while ((newline = buffer.indexOf("\n")) >= 0) {
+            const event = JSON.parse(buffer.slice(0, newline));
+            buffer = buffer.slice(newline + 1);
+            if (event.type === "outcome") {
+              f.sessionComplete = event.sessionComplete;
+              setLessonBoth(event.state);
+              if (userTurnId !== -1) {
+                patchTurn(userTurnId, {
+                  verdict: event.verdict,
+                  matchedForm: event.verification?.formFound ? event.verification.matchedForm : null,
+                });
+              }
+              entry = {
+                at: new Date().toISOString(),
+                wordId: lessonBefore.current?.wordId ?? null,
+                hintLevelBefore: lessonBefore.current?.hintLevel ?? null,
+                utterance: input.utterance ?? null,
+                action: input.action ?? null,
+                analysis: event.analysis,
+                verification: event.verification,
+                verdict: event.verdict,
+                directive: event.directive,
+                judgeModel: event.judgeModel,
+                judgeFallback: event.judgeFallback,
+                judgeMs: event.judgeMs,
+                reply: "",
+              };
+              setLog((l) => [...l, entry!]);
+            } else if (event.type === "text") {
+              text += event.text;
+              patchTurn(assistantTurnId, { text });
+              speaker.enqueue(event.text);
+            } else if (event.type === "done" && entry) {
+              const finished: TurnLog = { ...entry, replyModel: event.model, replyMs: event.replyMs, redactions: event.redactions, reply: text.trim() };
+              setLog((l) => l.map((x) => (x === entry ? finished : x)));
+            } else if (event.type === "error") {
+              setNotice(event.message);
+            }
+          }
         }
         if (inflight.current !== f) return;
-        const rest = splitter.flush();
-        if (rest) speaker.enqueue(rest);
         patchTurn(assistantTurnId, { text: text.trim(), streaming: false });
-        if (!text.trim()) {
-          updateTurns((t) => t.filter((x) => x.id !== assistantTurnId));
-        }
+        if (!text.trim()) updateTurns((t) => t.filter((x) => x.id !== assistantTurnId));
         speaker.finish();
       } catch (err) {
         if (f.controller.signal.aborted) return;
         inflight.current = null;
         updateTurns((t) => t.filter((x) => x.id !== assistantTurnId));
+        setLessonBoth(lessonBefore);
         setNotice(err instanceof Error ? err.message : "Something went wrong.");
         void afterCoachDone();
       }
     },
-    [addTurn, afterCoachDone, micOpen, patchTurn, setStatusBoth, updateTurns],
+    [addTurn, afterCoachDone, micOpen, patchTurn, setLessonBoth, setStatusBoth, updateTurns],
   );
+
+  const respond = useCallback((utterance: string, opts: { typed?: boolean } = {}) => runTurn({ utterance, typed: opts.typed }), [runTurn]);
 
   /** Decides whether the learner's pause ends their turn. */
   const evaluateTurn = useCallback(async () => {
@@ -400,12 +490,17 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
     if (capTimer.current) clearTimeout(capTimer.current);
     interrupt("button");
     resetPendingTurn();
+    if (lessonRef.current) setLessonBoth(finishSession(lessonRef.current));
     setStatusBoth("ended");
     browserSttRef.current?.stop();
     const vad = vadRef.current;
     vadRef.current = null;
     await vad?.destroy().catch(() => {});
-  }, [interrupt, resetPendingTurn, setStatusBoth]);
+  }, [interrupt, resetPendingTurn, setLessonBoth, setStatusBoth]);
+
+  useEffect(() => {
+    endRef.current = end;
+  }, [end]);
 
   const start = useCallback(async () => {
     setError(null);
@@ -422,6 +517,8 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
     turnsRef.current = [];
     setTurns([]);
     setMetrics({ responseMs: [], endToEndMs: [] });
+    setLog([]);
+    setLessonBoth(createSession(settingsRef.current.level));
     resetPendingTurn();
 
     let micOk = true;
@@ -468,8 +565,14 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
     }
 
     capTimer.current = setTimeout(() => {
-      setNotice("Session time limit reached (10 minutes). Start again whenever you're ready!");
-      void end();
+      setNotice("Time's up for this session (8 minutes). Start again whenever you're ready!");
+      // Let Lexi say goodbye if she isn't mid-reply; otherwise just close the session.
+      if (!inflight.current && lessonRef.current?.stage !== "done") {
+        resetPendingTurn();
+        void runTurn({ action: "time_up" });
+      } else {
+        void end();
+      }
     }, SESSION_CAP_MS);
 
     // Instant scripted greeting: no LLM round-trip needed.
@@ -482,6 +585,8 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
       requestedAt: performance.now(),
       speechEndedAt: null,
       audioStarted: false,
+      lessonBefore: null,
+      sessionComplete: false,
     };
     inflight.current = f;
     speaker.begin();
@@ -501,7 +606,7 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
     if (settingsRef.current.headphones && micOk) await micOpen(true);
     speaker.enqueue(GREETING_TEXT);
     speaker.finish();
-  }, [addTurn, afterCoachDone, end, micOpen, resetPendingTurn, setStatusBoth, switchToBrowserStt]);
+  }, [addTurn, afterCoachDone, end, micOpen, resetPendingTurn, runTurn, setLessonBoth, setStatusBoth, switchToBrowserStt]);
 
   const sendText = useCallback(
     (text: string) => {
@@ -512,6 +617,16 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
       void respond(t, { typed: true });
     },
     [interrupt, resetPendingTurn, respond],
+  );
+
+  const sendAction = useCallback(
+    (action: "hint" | "skip") => {
+      if (statusRef.current === "ended" || statusRef.current === "idle" || lessonRef.current?.stage !== "mission") return;
+      if (inflight.current) interrupt("button");
+      resetPendingTurn();
+      void runTurn({ action });
+    },
+    [interrupt, resetPendingTurn, runTurn],
   );
 
   const stopCoach = useCallback(() => {
@@ -545,10 +660,13 @@ export function useVoiceCoach(settings: Settings, opts: { groqStt: boolean }) {
     micAvailable,
     sttEngine,
     metrics,
+    lesson,
+    log,
     levelRef,
     start,
     end,
     sendText,
+    sendAction,
     stopCoach,
     dismissNotice: () => setNotice(null),
     setError,

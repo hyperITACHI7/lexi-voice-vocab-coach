@@ -52,6 +52,32 @@ These come from the problem statement's solution principles and known LLM limita
 
 **Trade-offs accepted:** higher end-to-end latency than speech-to-speech (VAD redemption + patience wait + STT + LLM), and a less natural default voice. **Revisit** if a Realtime-capable key becomes available: the `lib/voice` layer is the only part to swap.
 
+### 2.2 Decision update (2026-09-17): code-directed turns instead of tool calls
+
+**Context:** The tool contract in §4 was designed for a Realtime model that talks and calls tools in one stream. On the Groq pipeline, depending on the model to call `record_attempt` risks edge cases E5.17 (skipped tool calls) and E5.19 (spoken verdict ≠ engine verdict), and a "never say the word" prompt rule is only a request.
+
+**Decision:** Each learner turn goes through `POST /api/turn`, which runs a fixed pipeline:
+
+```
+learner turn ─► judge (gpt-oss-20b, strict JSON: intent, goal, used word?, usage correct?, issue, correction)
+            ─► verifyUsage() code check (forms, fuzzy ASR match, confusables)
+            ─► engine: applyLearnerTurn() → new state + verdict + Directive + redact mode
+            ─► coach (gpt-oss-120b, streamed) phrases the Directive
+            ─► sentence-level redaction replaces the target word with "that word" where recall is required
+            ─► NDJSON to client: outcome (state, verdict) → text sentences → done
+```
+
+| Concern | How it's handled |
+|---|---|
+| Tool-call compliance (E5.17, E5.18) | No tool calls. Every turn is judged and applied by code. |
+| Spoken verdict mismatch (E5.19) | The coach only receives the engine's Directive ("praise", "hint level 2: …", "reveal"). It never decides correctness. |
+| Word leaks (E5.1) | Structural: redaction mode `all` (hints, repeats, redirects) or `questions` (mission prompt while teaching). The learner can't hear the word early even if the model says it. |
+| Prompt injection (E6.3) | Judge treats rule-change requests as `off_topic`. Correctness requires code check AND judge. |
+| State | Client holds the `SessionState` and sends it every turn; the server validates it (`parseSessionState`). Tampering only affects the learner's own progress. |
+| Free-tier limits | Judge and coach use different models, so each has its own per-model limits; both fall back to the other model on 429/access errors. |
+
+**Trade-off:** two model calls per turn (judge adds ~0.6s median). Measured reply → voice median 1.07s on local voice test.
+
 ---
 
 ## 3. System overview
@@ -249,11 +275,11 @@ Each phase is **deployed to a link** and has exit criteria. Timeline is for a sm
 ### Phase 2: Core learning loop (the MVP's reason to exist)
 **Goal:** Validate H1, H3, H4, H5 at small scale: missions, hints, and honest verification.
 
-**Build**
-- `data/words.json`: ~20 words per level to start (60 total), schema above, reviewed by a human for correctness.
-- `lib/engine/`: state machine, word selector (new words only for now), `verifyUsage()` (lemma/form match + fuzzy), hint-ladder progression, attempt limits. **Unit tests** for verifier and transitions.
-- Tools wired: `start_word`, `record_attempt`, `get_next_word`, `learner_request`, `end_session`. Client tool router sends `function_call_output` back and triggers the next response.
-- Full instruction architecture (§4) with the "never say the target word during MISSION" rule and 2–3 in-prompt examples of good missions and hints.
+**Build** *(updated for code-directed turns, see §2.2)*
+- `src/data/words.ts`: 20 words per level (60 total) with definition, example, collocations, accepted forms, misuse, confusables, and 3 hints. Tests enforce that hints and definitions never contain the word.
+- `src/lib/engine/`: `session.ts` (state machine, hint ladder, statuses), `verify.ts` (form/fuzzy/confusable matching), `words.ts` (goal-aware selection), `redact.ts`. **Unit tests** for all.
+- `src/lib/server/judge.ts` (strict-JSON judge), `coachPrompt.ts` (Directive → instructions), `POST /api/turn` (NDJSON stream). Replaces the Phase 1 `/api/chat` route.
+- Teach and mission are combined in one coach turn (word, meaning, example, then a concrete situation question without the word).
 - UI:
   - **Level picker** before Start.
   - **Word card:** hidden during MISSION (shows "???" + hint level meter). Revealed after TEACH and after VERIFY.
@@ -262,12 +288,12 @@ Each phase is **deployed to a link** and has exit criteria. Timeline is for a sm
 - Session cap: 3 words or 8 minutes, whichever comes first.
 - Event log (console + in-memory array, downloadable JSON for eval review).
 
-**Exit criteria**
-- [ ] A full session covers 3 words: teach → mission → verify, with at least one hint path exercised.
-- [ ] Leak rate (agent says the target word during MISSION) ≤ 10% across 20 missions. Target ≤ 5% by Phase 5.
-- [ ] Verifier unit tests pass (inflections, derivations, punctuation, near-miss ASR spellings, synonym-only).
-- [ ] Verdict agreement with a human rater ≥ 80% on 30 recorded attempts.
-- [ ] Model calls `record_attempt` after ≥ 95% of attempts (the log shows no silent skips).
+**Exit criteria** *(status 2026-09-17)*
+- [x] A full session covers 3 words: teach → mission → verify, with at least one hint path exercised. *(Browser E2E: hint button → synonym → hints 2–3 → reveal → correct → skip → correct first try → recap.)*
+- [x] Leak rate ≤ 10%. *(Structural: sentence-level redaction; the learner can't hear the word during recall turns. Redaction count is logged per turn to track how often the model tries.)*
+- [x] Verifier unit tests pass (inflections, derivations, punctuation, near-miss ASR spellings, synonym-only, confusables, stutters). *(38 unit tests total.)*
+- [x] Verdict agreement ≥ 80% on 30 attempts. *(`scripts/eval-judge.ts`: 32/32 = 100%, 0/17 false positives, 4/4 intents, judge median 634ms. Caveat: labels written by the builder, not an independent rater.)*
+- [x] ~~Model calls `record_attempt` after ≥ 95% of attempts.~~ Superseded: no tool calls (§2.2).
 - [ ] 3 testers (outside the team) complete a session without help → **Link v1**.
 
 ---

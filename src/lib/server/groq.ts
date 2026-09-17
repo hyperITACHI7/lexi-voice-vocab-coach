@@ -3,6 +3,9 @@ import Groq from "groq-sdk";
 export const MODELS = {
   chat: process.env.GROQ_CHAT_MODEL ?? "openai/gpt-oss-120b",
   chatFallback: process.env.GROQ_CHAT_FALLBACK_MODEL ?? "openai/gpt-oss-20b",
+  // The judge runs on a different model than the coach so the two calls per turn use separate free-tier limits.
+  judge: process.env.GROQ_JUDGE_MODEL ?? "openai/gpt-oss-20b",
+  judgeFallback: process.env.GROQ_JUDGE_FALLBACK_MODEL ?? "openai/gpt-oss-120b",
   stt: process.env.GROQ_STT_MODEL ?? "whisper-large-v3-turbo",
   sttFallback: process.env.GROQ_STT_FALLBACK_MODEL ?? "whisper-large-v3",
   tts: process.env.GROQ_TTS_MODEL ?? "canopylabs/orpheus-v1-english",
