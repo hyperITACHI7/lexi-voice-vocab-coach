@@ -1,0 +1,31 @@
+{
+  "name": "vocab-voice-coach",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "postinstall": "node scripts/copy-vad-assets.mjs",
+    "dev": "next dev",
+    "build": "node scripts/copy-vad-assets.mjs && next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "node --test --experimental-strip-types src/lib/**/*.test.ts"
+  },
+  "dependencies": {
+    "@ricky0123/vad-web": "^0.0.31",
+    "groq-sdk": "^1.6.0",
+    "next": "16.3.5",
+    "onnxruntime-web": "^1.30.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.5",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
